@@ -397,7 +397,9 @@ def _worker_entry(
         print("KeyboardInterrupt in worker")
         return 130
     except Exception as e:
+        import traceback
         print(f"FATAL {type(e).__name__}: {e}")
+        traceback.print_exc()
         return 1
 
 
@@ -526,15 +528,28 @@ def main() -> int:
     auto_listener = _env_bool("BATCH_START_MAIL_LISTENER", True) and not args.no_mail_listener
     mail_proc = _start_mail_listener(auto_listener)
     exit_code = 0
+    interrupted = False
     try:
-        if args.workers == 1:
-            exit_code = _run_loop(args, headless, slow_mo_ms)
-        else:
-            exit_code = _run_pool(args, args.workers, headless, slow_mo_ms)
+        try:
+            if args.workers == 1:
+                exit_code = _run_loop(args, headless, slow_mo_ms)
+            else:
+                exit_code = _run_pool(args, args.workers, headless, slow_mo_ms)
+        except KeyboardInterrupt:
+            interrupted = True
+            exit_code = 130
 
-        if mail_proc is not None and args.verify_wait_sec > 0:
-            print(f"[mail-listener] wait {args.verify_wait_sec}s for pending verification...")
-            time.sleep(args.verify_wait_sec)
+        if exit_code == 130:
+            interrupted = True
+
+        if not interrupted and mail_proc is not None and args.verify_wait_sec > 0:
+            try:
+                print(f"[mail-listener] wait {args.verify_wait_sec}s for pending verification...")
+                time.sleep(args.verify_wait_sec)
+            except KeyboardInterrupt:
+                print("[mail-listener] wait interrupted by Ctrl+C")
+                interrupted = True
+                exit_code = 130
 
         return exit_code
     finally:

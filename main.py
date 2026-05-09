@@ -54,7 +54,11 @@ def _run_script(script: str, *args: str) -> int:
     env.setdefault("PYTHONIOENCODING", "utf-8")
     cmd = [sys.executable, str(SCRIPTS / script), *args]
     print("\n[run] " + " ".join(cmd))
-    return subprocess.call(cmd, cwd=str(ROOT), env=env)
+    try:
+        return subprocess.call(cmd, cwd=str(ROOT), env=env)
+    except KeyboardInterrupt:
+        print("\n[run] Ctrl+C — đợi script con thoát...")
+        return 130
 
 
 def show_stats() -> None:
@@ -150,23 +154,30 @@ def menu() -> int:
         print("5) Show DB stats")
         print("6) Reset stuck registering")
         print("0) Exit")
-        choice = input("Chọn: ").strip()
-        if choice == "1":
-            run_register()
-        elif choice == "2":
-            run_mail_listener()
-        elif choice == "3":
-            export_verified()
-        elif choice == "4":
-            generate_aliases_to_db()
-        elif choice == "5":
-            show_stats()
-        elif choice == "6":
-            reset_stuck()
-        elif choice == "0":
+        try:
+            choice = input("Chọn: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n[main] thoát.")
             return 0
-        else:
-            print("Chọn không hợp lệ.")
+        try:
+            if choice == "1":
+                run_register()
+            elif choice == "2":
+                run_mail_listener()
+            elif choice == "3":
+                export_verified()
+            elif choice == "4":
+                generate_aliases_to_db()
+            elif choice == "5":
+                show_stats()
+            elif choice == "6":
+                reset_stuck()
+            elif choice == "0":
+                return 0
+            else:
+                print("Chọn không hợp lệ.")
+        except KeyboardInterrupt:
+            print("\n[main] Ctrl+C — quay lại menu. Bấm 0 để thoát.")
 
 
 if __name__ == "__main__":
