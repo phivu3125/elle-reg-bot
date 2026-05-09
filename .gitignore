@@ -31,6 +31,7 @@ camoufox-profile-*/
 chrome-profile/
 playwright-profile/
 playwright-profile-*/
+profiles/
 
 # --- Runtime artifacts ---
 .tmp/

@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import multiprocessing as mp
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -65,7 +66,7 @@ try:
     DEFAULT_SLEEP_SEC = max(0.0, float(os.environ.get("BATCH_SLEEP_SEC", "5")))
 except ValueError:
     DEFAULT_SLEEP_SEC = 5.0
-DEFAULT_PROFILE_PREFIX = os.environ.get("BATCH_PROFILE_PREFIX") or f"camoufox-profile-{os.getpid()}-w"
+DEFAULT_PROFILE_PREFIX = os.environ.get("BATCH_PROFILE_PREFIX") or "profiles/w"
 BATCH_LOG_LEVEL = os.environ.get("BATCH_LOG_LEVEL", "normal").strip().lower()
 try:
     DEFAULT_WORKERS = max(1, int(os.environ.get("BATCH_WORKERS", "5")))
@@ -159,6 +160,30 @@ def _stop_mail_listener(proc: subprocess.Popen | None) -> None:
         print("[mail-listener] still alive, killing")
         proc.kill()
         proc.wait(timeout=5)
+
+
+def _cleanup_profiles(profile_prefix: str, n_workers: int) -> None:
+    """Xoá worker profile dirs sau khi pool chạy xong để tránh đầy disk."""
+    removed = 0
+    parents: set[Path] = set()
+    for wid in range(n_workers):
+        path = REG_BOT_DIR / f"{profile_prefix}{wid}"
+        if path.exists():
+            try:
+                shutil.rmtree(path, ignore_errors=False)
+                removed += 1
+                parents.add(path.parent)
+            except OSError as e:
+                print(f"[cleanup] WARN không xoá được {path}: {e}")
+    # Xoá folder cha rỗng (vd: profiles/) nếu nằm trong REG_BOT_DIR và đã trống
+    for parent in parents:
+        try:
+            if parent != REG_BOT_DIR and parent.exists() and not any(parent.iterdir()):
+                parent.rmdir()
+        except OSError:
+            pass
+    if removed:
+        print(f"[cleanup] removed {removed} profile dir(s) (prefix={profile_prefix!r})")
 
 
 # --------------------------------------------------------------------------
@@ -435,7 +460,9 @@ def _run_pool(
 
     procs: list[mp.Process] = []
     for wid in range(n_workers):
-        profile_dir = str(REG_BOT_DIR / f"{args.profile_prefix}{wid}")
+        profile_path = REG_BOT_DIR / f"{args.profile_prefix}{wid}"
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        profile_dir = str(profile_path)
         proc = mp.Process(
             target=_worker_entry,
             args=(wid, worker_args, profile_dir, headless, slow_mo_ms),
@@ -512,6 +539,12 @@ def main() -> int:
         default=_env_int("BATCH_VERIFY_WAIT_SEC", 120),
         help="Sau khi batch xong, chờ mail listener xử lý thêm N giây rồi dừng (default đọc BATCH_VERIFY_WAIT_SEC hoặc 120).",
     )
+    p.add_argument(
+        "--no-clean-profiles",
+        action="store_true",
+        help="Không xoá worker profile dirs sau khi chạy xong (default: xoá để đỡ rác). "
+             "Cũng có thể tắt bằng env BATCH_CLEAN_PROFILES=false.",
+    )
     args = p.parse_args()
 
     if args.batch_size <= 0:
@@ -554,6 +587,12 @@ def main() -> int:
         return exit_code
     finally:
         _stop_mail_listener(mail_proc)
+        clean = _env_bool("BATCH_CLEAN_PROFILES", True) and not args.no_clean_profiles
+        if clean:
+            try:
+                _cleanup_profiles(args.profile_prefix, args.workers)
+            except Exception as e:
+                print(f"[cleanup] WARN: {e}")
 
 
 if __name__ == "__main__":
