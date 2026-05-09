@@ -31,16 +31,43 @@ EOF
   esac
 done
 
+suggest_python_install() {
+  echo ""
+  echo "Python 3 not found. Install it with the command for your OS, then rerun ./install.sh:"
+  echo ""
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    if command -v brew >/dev/null 2>&1; then
+      echo "  brew install python@3.12"
+    else
+      echo "  Install Homebrew first: https://brew.sh"
+      echo "  Then: brew install python@3.12"
+    fi
+  elif command -v apt-get >/dev/null 2>&1; then
+    echo "  sudo apt update && sudo apt install -y python3 python3-venv python3-pip"
+  elif command -v dnf >/dev/null 2>&1; then
+    echo "  sudo dnf install -y python3 python3-virtualenv python3-pip"
+  elif command -v pacman >/dev/null 2>&1; then
+    echo "  sudo pacman -S --needed python python-virtualenv python-pip"
+  elif command -v zypper >/dev/null 2>&1; then
+    echo "  sudo zypper install -y python3 python3-venv python3-pip"
+  elif command -v apk >/dev/null 2>&1; then
+    echo "  sudo apk add python3 py3-virtualenv py3-pip"
+  else
+    echo "  Install Python 3.11+ from https://www.python.org/downloads/"
+  fi
+  echo ""
+}
+
 find_python() {
   if command -v python3 >/dev/null 2>&1; then
     command -v python3
-    return
+    return 0
   fi
   if command -v python >/dev/null 2>&1; then
     command -v python
-    return
+    return 0
   fi
-  echo "Python not found. Install Python 3.11+ then rerun this script." >&2
+  suggest_python_install >&2
   exit 1
 }
 
@@ -108,5 +135,5 @@ fi
 cat <<EOF
 
 Install finished. Edit .env anytime; values are loaded at runtime.
-Run: ./.venv/bin/python main.py
+Run: ./run.sh
 EOF

@@ -1,7 +1,8 @@
 param(
     [switch]$SkipFetch,
     [switch]$NoPrompt,
-    [switch]$EditEnv
+    [switch]$EditEnv,
+    [switch]$NoAutoPython
 )
 
 $ErrorActionPreference = "Stop"
@@ -9,14 +10,61 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
 
-function Find-Python {
+function Test-Python {
     if (Get-Command py -ErrorAction SilentlyContinue) {
         return @{ Exe = "py"; Args = @("-3") }
     }
     if (Get-Command python -ErrorAction SilentlyContinue) {
         return @{ Exe = "python"; Args = @() }
     }
-    throw "Python not found. Install Python 3.11+ from https://www.python.org/downloads/ then rerun this script."
+    return $null
+}
+
+function Install-PythonViaWinget {
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+    Write-Host ""
+    Write-Host "Python not found. Trying to install via winget..."
+    Write-Host "  winget install --id Python.Python.3.12 -e --silent --accept-source-agreements --accept-package-agreements"
+    try {
+        winget install --id Python.Python.3.12 -e --silent --accept-source-agreements --accept-package-agreements
+    } catch {
+        Write-Host "winget install failed: $_"
+        return $false
+    }
+
+    # Refresh PATH for current session
+    $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+    $userPath    = [System.Environment]::GetEnvironmentVariable("Path", "User")
+    $env:Path = "$machinePath;$userPath"
+    return $true
+}
+
+function Get-Python {
+    $python = Test-Python
+    if ($python) { return $python }
+
+    if ($NoAutoPython) {
+        throw "Python not found. Install Python 3.11+ from https://www.python.org/downloads/ then rerun."
+    }
+
+    $ok = Install-PythonViaWinget
+    if ($ok) {
+        $python = Test-Python
+        if ($python) { return $python }
+    }
+
+    throw @"
+Python not found and auto-install failed.
+
+Install Python 3.11+ manually, then rerun .\install.ps1:
+  - winget install --id Python.Python.3.12 -e
+  - or download from https://www.python.org/downloads/windows/
+    (tick "Add python.exe to PATH" + "py launcher" during install)
+
+After installing, OPEN A NEW POWERSHELL WINDOW so PATH refreshes.
+"@
 }
 
 function Run-Python($Python, [string[]]$ArgsList) {
@@ -34,7 +82,7 @@ function Open-EnvFile {
 
 Write-Host "== ELLE Reg-Bot Windows install =="
 
-$Python = Find-Python
+$Python = Get-Python
 Write-Host "Using Python launcher: $($Python.Exe) $($Python.Args -join ' ')"
 
 if (-not (Test-Path ".venv")) {
@@ -82,4 +130,4 @@ if ($EditEnv -or ($CreatedEnv -and -not $NoPrompt)) {
 
 Write-Host ""
 Write-Host "Install finished. Edit .env anytime; values are loaded at runtime."
-Write-Host "Run: .\.venv\Scripts\python.exe main.py"
+Write-Host "Run: .\run.ps1"

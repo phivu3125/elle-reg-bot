@@ -17,19 +17,9 @@ Bot dùng **Python + Camoufox**. Không cần Chrome/Chromium cài sẵn.
 
 ## Yêu cầu
 
-- Python **3.11+**
-- Internet để cài package và fetch Camoufox browser assets
+- Internet để cài package và fetch Camoufox browser assets (~150MB, 1 lần)
 - Gmail App Password nếu dùng Gmail IMAP
-
-Kiểm tra Python:
-
-```powershell
-py -3 --version
-```
-
-```bash
-python3 --version
-```
+- Python **3.11+** — **`install.ps1` sẽ tự cài qua winget nếu thiếu** (Windows). Trên Linux/macOS, `install.sh` sẽ in lệnh chính xác cho distro của bạn.
 
 ## Cài đặt trên Windows
 
@@ -231,6 +221,25 @@ __pycache__/
 ```
 
 ## Troubleshooting
+
+### Không có Python (install.ps1 / install.sh báo "Python not found")
+
+Windows: `install.ps1` đã tự cài qua winget. Nếu fail, tự chạy:
+
+```powershell
+winget install --id Python.Python.3.12 -e
+```
+
+Rồi **mở PowerShell mới** và chạy lại `.\install.ps1`.
+
+Linux/macOS: copy lệnh mà `install.sh` in ra. Tóm tắt:
+
+```bash
+sudo apt install -y python3 python3-venv python3-pip      # Ubuntu/Debian
+sudo dnf install -y python3 python3-virtualenv python3-pip # Fedora/RHEL
+sudo pacman -S --needed python python-virtualenv python-pip # Arch
+brew install python@3.12                                   # macOS
+```
 
 ### PowerShell chặn script
 
