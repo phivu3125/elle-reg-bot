@@ -1,0 +1,50 @@
+# --- Secrets / state ---
+.env
+.env.*
+!.env.example
+
+# --- Local database (PII: emails, sessions) ---
+accounts.db
+accounts.db-journal
+accounts.db-wal
+accounts.db-shm
+accounts.db.backup-*
+accounts.txt
+verified*.txt
+output/
+*.session.json
+
+# --- Python ---
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Browser profiles (cookies, fingerprints, big binary blobs) ---
+camoufox-profile/
+camoufox-profile-*/
+chrome-profile/
+playwright-profile/
+playwright-profile-*/
+
+# --- Runtime artifacts ---
+.tmp/
+.local/
+*.log
+logs/
+screenshots/
+trace.zip
+videos/
+
+# --- Scratch / smoke ---
+scripts/_smoke_*.py
+_reset.py
+
+# --- OS ---
+.DS_Store
+Thumbs.db
