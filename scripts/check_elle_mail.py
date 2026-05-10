@@ -7,6 +7,7 @@ Usage:
     py scripts/check_elle_mail.py --all            # bao gồm cả mail đã đọc (default chỉ UNSEEN)
     py scripts/check_elle_mail.py --no-verify      # chỉ in mail, KHÔNG click verify
     py scripts/check_elle_mail.py --once --no-verify  # 1 lần, chỉ xem
+    py scripts/check_elle_mail.py --backfill-awaiting # quét cả mail đã đọc, verify lại các account awaiting_*
 
 Env (Reg-Bot/.env):
     IMAP_USER         Gmail address (vd: yourname@gmail.com)
@@ -45,6 +46,8 @@ try:
     from accounts_db import (
         STATUS_AWAITING_MAIL,
         STATUS_AWAITING_VERIFY,
+        STATUS_EXPORTED_FAILED_VERIFY,
+        STATUS_EXPORTED_VERIFIED,
         STATUS_FAILED_VERIFY,
         STATUS_VERIFIED,
         append_event,
@@ -402,24 +405,39 @@ async def run_async(
                                 continue
                             seen_ids.add(mid)
 
+                            should_skip_verify = False
                             if _DB_OK and to_addr:
                                 try:
                                     acc = get_account(to_addr)
                                     if acc is None:
                                         print(f"[db] WARN {to_addr} không có trong accounts.db (skip)")
-                                    elif acc["status"] == STATUS_AWAITING_MAIL:
-                                        update_status(
-                                            to_addr,
-                                            STATUS_AWAITING_VERIFY,
-                                            mail_received_ts=int(time.time()),
-                                        )
-                                        append_event(to_addr, "mail_received", ok=True)
-                                        print(f"[db] {to_addr} -> awaiting_verify")
+                                        should_skip_verify = True
                                     else:
-                                        print(f"[db] {to_addr} status={acc['status']} (no flip)")
+                                        cur_status = acc["status"]
+                                        if cur_status == STATUS_AWAITING_MAIL:
+                                            update_status(
+                                                to_addr,
+                                                STATUS_AWAITING_VERIFY,
+                                                mail_received_ts=int(time.time()),
+                                            )
+                                            append_event(to_addr, "mail_received", ok=True)
+                                            print(f"[db] {to_addr} -> awaiting_verify")
+                                        elif cur_status == STATUS_AWAITING_VERIFY:
+                                            print(f"[db] {to_addr} status=awaiting_verify (re-verify)")
+                                        elif cur_status in (STATUS_VERIFIED, STATUS_EXPORTED_VERIFIED):
+                                            print(f"[db] {to_addr} status={cur_status} (skip, already verified)")
+                                            should_skip_verify = True
+                                        elif cur_status in (STATUS_FAILED_VERIFY, STATUS_EXPORTED_FAILED_VERIFY):
+                                            print(f"[db] {to_addr} status={cur_status} (skip, failed previously)")
+                                            should_skip_verify = True
+                                        else:
+                                            print(f"[db] {to_addr} status={cur_status} (skip)")
+                                            should_skip_verify = True
                                 except Exception as e:
                                     print(f"[db] update mail_received failed: {e}")
 
+                            if should_skip_verify:
+                                continue
                             if not verify:
                                 continue
                             hit = find_verify_link(links, keywords)
@@ -513,6 +531,11 @@ def main() -> int:
     p.add_argument("--once", action="store_true", help="poll một lần rồi thoát")
     p.add_argument("--all", action="store_true", help="bao gồm cả mail đã đọc (default chỉ UNSEEN)")
     p.add_argument(
+        "--backfill-awaiting",
+        action="store_true",
+        help="Quét cả mail đã đọc (implies --all) để xử lý các account còn awaiting_mail/awaiting_verify",
+    )
+    p.add_argument(
         "--verify",
         dest="verify",
         action="store_true",
@@ -539,11 +562,14 @@ def main() -> int:
         help="in đầy đủ TEXT/HTML body + links (debug)",
     )
     args = p.parse_args()
+    include_seen = args.all or args.backfill_awaiting
+    if args.backfill_awaiting and not args.all:
+        print("[backfill] --backfill-awaiting bật → tự bật --all (quét cả mail đã đọc)")
     try:
         return asyncio.run(
             run_async(
                 once=args.once,
-                include_seen=args.all,
+                include_seen=include_seen,
                 verify=args.verify,
                 quiet=args.quiet,
             )

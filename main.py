@@ -156,6 +156,15 @@ def reset_stuck() -> None:
     show_stats()
 
 
+def run_mail_backfill() -> None:
+    _print_header("Mail verifier — backfill awaiting (quét cả mail đã đọc)")
+    print("Dùng khi mail xác minh tới rất trễ (vài giờ sau register).")
+    print("Sẽ quét CẢ mail đã đọc và verify lại các account còn awaiting_mail/awaiting_verify.")
+    print("Account đã verified hoặc failed_verify sẽ được skip.")
+    print("Ctrl+C để dừng listener.")
+    _run_script("check_elle_mail.py", "--backfill-awaiting")
+
+
 def menu() -> int:
     while True:
         _print_header("ELLE Reg-Bot Terminal UI")
@@ -166,6 +175,7 @@ def menu() -> int:
         print("5) Generate aliases → DB")
         print("6) Show DB stats")
         print("7) Reset stuck registering")
+        print("8) Mail verifier — backfill awaiting (mail tới trễ)")
         print("0) Exit")
         try:
             choice = input("Chọn: ").strip()
@@ -187,6 +197,8 @@ def menu() -> int:
                 show_stats()
             elif choice == "7":
                 reset_stuck()
+            elif choice == "8":
+                run_mail_backfill()
             elif choice == "0":
                 return 0
             else:
