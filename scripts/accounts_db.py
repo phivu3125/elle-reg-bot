@@ -38,6 +38,7 @@ STATUS_EXPORTED_VERIFIED = "exported_verified"
 STATUS_SESSION_SAVED = "session_saved"
 STATUS_FAILED_REGISTER = "failed_register"
 STATUS_FAILED_VERIFY = "failed_verify"
+STATUS_EXPORTED_FAILED_VERIFY = "exported_failed_verify"
 
 ALL_STATUSES = {
     STATUS_PENDING,
@@ -49,6 +50,13 @@ ALL_STATUSES = {
     STATUS_SESSION_SAVED,
     STATUS_FAILED_REGISTER,
     STATUS_FAILED_VERIFY,
+    STATUS_EXPORTED_FAILED_VERIFY,
+}
+
+# Mapping: source status → exported target status (cho export-unexported flow)
+_EXPORT_STATUS_MAP = {
+    STATUS_VERIFIED: STATUS_EXPORTED_VERIFIED,
+    STATUS_FAILED_VERIFY: STATUS_EXPORTED_FAILED_VERIFY,
 }
 
 # Columns on `accounts` that callers may update via update_status(**fields)
@@ -155,10 +163,14 @@ def _migrate_if_old_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE accounts ADD COLUMN exported_ts INTEGER")
         conn.commit()
 
-    # Backfill DBs created before explicit exported_verified status existed.
+    # Backfill DBs created before explicit exported_* statuses existed.
     conn.execute(
         "UPDATE accounts SET status = ? WHERE status = ? AND exported_ts IS NOT NULL",
         (STATUS_EXPORTED_VERIFIED, STATUS_VERIFIED),
+    )
+    conn.execute(
+        "UPDATE accounts SET status = ? WHERE status = ? AND exported_ts IS NOT NULL",
+        (STATUS_EXPORTED_FAILED_VERIFY, STATUS_FAILED_VERIFY),
     )
     conn.commit()
 
@@ -414,14 +426,28 @@ def export_by_status(statuses: Iterable[str], use_raw: bool = True) -> list[dict
     return out
 
 
-def export_verified_unexported(out_path: str | Path, use_raw: bool = True) -> int:
-    """Append verified, not-yet-exported accounts to `out_path`, then mark them exported.
+def export_unexported_by_status(
+    source_status: str,
+    out_path: str | Path,
+    use_raw: bool = True,
+) -> int:
+    """Append accounts có status=`source_status` và exported_ts IS NULL vào
+    `out_path` (append mode), rồi đổi status sang target tương ứng và set
+    exported_ts. Idempotent: chạy nhiều lần không double-export.
 
-    Chỉ export rows có status='verified' và exported_ts IS NULL. File được mở
-    append mode để chạy nhiều lần không ghi đè dữ liệu cũ. Export xong đổi
-    status → 'exported_verified' để stats nhìn rõ đã xuất.
-    Returns số account được export trong lần chạy này.
+    Hỗ trợ:
+      - verified       → exported_verified
+      - failed_verify  → exported_failed_verify
+
+    Returns số account export được trong lần chạy này.
     """
+    if source_status not in _EXPORT_STATUS_MAP:
+        raise ValueError(
+            f"Status '{source_status}' không hỗ trợ export-unexported. "
+            f"Chỉ hỗ trợ: {sorted(_EXPORT_STATUS_MAP)}"
+        )
+    target_status = _EXPORT_STATUS_MAP[source_status]
+
     path = Path(out_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     now = int(time.time())
@@ -436,7 +462,7 @@ def export_verified_unexported(out_path: str | Path, use_raw: bool = True) -> in
             WHERE status = ? AND exported_ts IS NULL
             ORDER BY verified_ts ASC NULLS LAST, rowid ASC
             """,
-            (STATUS_VERIFIED,),
+            (source_status,),
         ).fetchall()
 
         if not rows:
@@ -458,13 +484,25 @@ def export_verified_unexported(out_path: str | Path, use_raw: bool = True) -> in
         placeholders = ",".join("?" * len(raw_emails))
         cur.execute(
             f"UPDATE accounts SET status = ?, exported_ts = ? WHERE raw_email IN ({placeholders})",
-            (STATUS_EXPORTED_VERIFIED, now, *raw_emails),
+            (target_status, now, *raw_emails),
         )
+        event_name = f"export_{source_status}"
         cur.executemany(
             "INSERT INTO events(raw_email, event, ok, detail, ts) VALUES (?, ?, ?, ?, ?)",
-            [(email, "export", 1, f"out={path}", now) for email in raw_emails],
+            [(email, event_name, 1, f"out={path}", now) for email in raw_emails],
         )
         return len(rows)
+
+
+def export_verified_unexported(out_path: str | Path, use_raw: bool = True) -> int:
+    """Backward-compat wrapper: export verified → exported_verified."""
+    return export_unexported_by_status(STATUS_VERIFIED, out_path, use_raw=use_raw)
+
+
+def export_failed_verify_unexported(out_path: str | Path, use_raw: bool = True) -> int:
+    """Export failed_verify (HTTP 400 verify nhưng login vẫn được) →
+    exported_failed_verify. Cùng cơ chế append-only như export verified."""
+    return export_unexported_by_status(STATUS_FAILED_VERIFY, out_path, use_raw=use_raw)
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +549,21 @@ def _cli() -> int:
         help="File .txt output append mode (default verified.txt)",
     )
     p_exp_verified.add_argument(
+        "--canonical",
+        action="store_true",
+        help="Dùng canonical_email thay vì raw_email gốc.",
+    )
+
+    p_exp_failed = sub.add_parser(
+        "export-failed-verify",
+        help="Append failed_verify chưa export vào file .txt rồi đổi status exported_failed_verify",
+    )
+    p_exp_failed.add_argument(
+        "--out",
+        default="failed-verify.txt",
+        help="File .txt output append mode (default failed-verify.txt)",
+    )
+    p_exp_failed.add_argument(
         "--canonical",
         action="store_true",
         help="Dùng canonical_email thay vì raw_email gốc.",
@@ -569,6 +622,13 @@ def _cli() -> int:
         print(f"[export-verified] appended {n} verified account(s) -> {args.out}")
         if n == 0:
             print("[export-verified] no new verified accounts to export")
+        return 0
+
+    if args.cmd == "export-failed-verify":
+        n = export_failed_verify_unexported(args.out, use_raw=not args.canonical)
+        print(f"[export-failed-verify] appended {n} failed_verify account(s) -> {args.out}")
+        if n == 0:
+            print("[export-failed-verify] no new failed_verify accounts to export")
         return 0
 
     return 1

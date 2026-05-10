@@ -98,6 +98,18 @@ def export_verified() -> None:
     show_stats()
 
 
+def export_failed_verify() -> None:
+    _print_header("Export failed_verify chưa export (HTTP 400 nhưng login OK)")
+    default_out = os.environ.get(
+        "UI_EXPORT_FAILED_VERIFY_OUT",
+        str(ROOT / "output" / "failed-verify-accounts.txt"),
+    )
+    out = _input_text("Output .txt", default_out)
+    n = accounts_db.export_failed_verify_unexported(out)
+    print(f"[export] appended {n} failed_verify account(s) -> {out}")
+    show_stats()
+
+
 def _existing_raw_emails() -> set[str]:
     with accounts_db.connect() as conn:
         rows = conn.execute("SELECT raw_email FROM accounts").fetchall()
@@ -150,9 +162,10 @@ def menu() -> int:
         print("1) Register batch")
         print("2) Mail verifier only")
         print("3) Export verified → txt")
-        print("4) Generate aliases → DB")
-        print("5) Show DB stats")
-        print("6) Reset stuck registering")
+        print("4) Export failed_verify → txt (HTTP 400 nhưng login OK)")
+        print("5) Generate aliases → DB")
+        print("6) Show DB stats")
+        print("7) Reset stuck registering")
         print("0) Exit")
         try:
             choice = input("Chọn: ").strip()
@@ -167,10 +180,12 @@ def menu() -> int:
             elif choice == "3":
                 export_verified()
             elif choice == "4":
-                generate_aliases_to_db()
+                export_failed_verify()
             elif choice == "5":
-                show_stats()
+                generate_aliases_to_db()
             elif choice == "6":
+                show_stats()
+            elif choice == "7":
                 reset_stuck()
             elif choice == "0":
                 return 0
