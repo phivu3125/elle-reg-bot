@@ -651,8 +651,8 @@ def main() -> int:
     p.add_argument(
         "--chunk-size",
         type=int,
-        default=200,
-        help="backfill: số mail mỗi chunk (default 200)",
+        default=10,
+        help="backfill: số mail mỗi chunk (default 10)",
     )
     args = p.parse_args()
     include_seen = args.all or args.backfill_awaiting
