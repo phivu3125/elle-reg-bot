@@ -51,6 +51,7 @@ try:
         STATUS_FAILED_VERIFY,
         STATUS_VERIFIED,
         append_event,
+        count_awaiting_verify,
         get_account,
         update_status,
     )
@@ -211,6 +212,7 @@ def fetch_messages(
     folder: str,
     sender: str,
     only_unseen: bool,
+    newest_first: bool = False,
 ) -> list[bytes]:
     typ, _ = mail.select(folder)
     if typ != "OK":
@@ -226,6 +228,8 @@ def fetch_messages(
         raise RuntimeError(f"IMAP search failed: {data!r}")
 
     ids = data[0].split() if data and data[0] else []
+    if newest_first:
+        ids.reverse()
     return ids
 
 
@@ -316,6 +320,8 @@ async def run_async(
     include_seen: bool,
     verify: bool,
     quiet: bool = True,
+    max_scan: int = 5000,
+    chunk_size: int = 200,
 ) -> int:
     load_dotenv()
     user = os.environ.get("IMAP_USER")
@@ -382,130 +388,205 @@ async def run_async(
                 mail.login(user, password)
                 print("[login] ok")
 
+                async def process_chunk(chunk_ids: list[bytes]) -> None:
+                    """Phase 1+2+3 trên 1 chunk: render → DB flip → parallel click → DB finalize."""
+                    # ---- Phase 1: render + DB flip awaiting_mail -> awaiting_verify (sync) ----
+                    pending_clicks: list[tuple[bytes, str, str, str]] = []
+                    for mid in chunk_ids:
+                        try:
+                            matched, links, to_addr = render_message(mail, mid, sender, quiet=quiet)
+                        except Exception as e:
+                            print(f"[mail] render failed id={mid!r}: {e}")
+                            continue
+                        if not matched:
+                            continue
+                        seen_ids.add(mid)
+
+                        should_skip_verify = False
+                        mark_terminal = False  # mark SEEN sau Phase 1 cho mail không cần retry nữa
+                        if _DB_OK and to_addr:
+                            try:
+                                acc = get_account(to_addr)
+                                if acc is None:
+                                    print(f"[db] WARN {to_addr} không có trong accounts.db (skip)")
+                                    should_skip_verify = True
+                                    mark_terminal = True
+                                else:
+                                    cur_status = acc["status"]
+                                    if cur_status == STATUS_AWAITING_MAIL:
+                                        update_status(
+                                            to_addr,
+                                            STATUS_AWAITING_VERIFY,
+                                            mail_received_ts=int(time.time()),
+                                        )
+                                        append_event(to_addr, "mail_received", ok=True)
+                                        print(f"[db] {to_addr} -> awaiting_verify")
+                                    elif cur_status == STATUS_AWAITING_VERIFY:
+                                        print(f"[db] {to_addr} status=awaiting_verify (re-verify)")
+                                    elif cur_status in (STATUS_VERIFIED, STATUS_EXPORTED_VERIFIED):
+                                        print(f"[db] {to_addr} status={cur_status} (skip, already verified)")
+                                        should_skip_verify = True
+                                        mark_terminal = True
+                                    elif cur_status in (STATUS_FAILED_VERIFY, STATUS_EXPORTED_FAILED_VERIFY):
+                                        print(f"[db] {to_addr} status={cur_status} (skip, failed previously)")
+                                        should_skip_verify = True
+                                        mark_terminal = True
+                                    else:
+                                        print(f"[db] {to_addr} status={cur_status} (skip)")
+                                        should_skip_verify = True
+                                        mark_terminal = True
+                            except Exception as e:
+                                print(f"[db] update mail_received failed: {e}")
+
+                        if mark_terminal:
+                            try:
+                                mark_seen(mail, mid)
+                            except Exception as e:
+                                print(f"[mail] mark_seen (terminal) failed mid={mid!r}: {e}")
+                        if should_skip_verify:
+                            continue
+                        if not verify:
+                            continue
+                        hit = find_verify_link(links, keywords)
+                        if hit is None:
+                            print(f"[verify] {to_addr or '?'} không tìm thấy link match keywords {keywords}")
+                            # Mail không có link verify → không bao giờ cứu được, mark seen để khỏi re-fetch
+                            try:
+                                mark_seen(mail, mid)
+                            except Exception as e:
+                                print(f"[mail] mark_seen (no-link) failed mid={mid!r}: {e}")
+                            continue
+                        vurl, vtext = hit
+                        pending_clicks.append((mid, to_addr, vurl, vtext))
+
+                    # ---- Phase 2: parallel async click ----
+                    if pending_clicks:
+                        t0 = time.time()
+                        print(f"[verify] click {len(pending_clicks)} link song song (concurrency={concurrency}, timeout={timeout_s}s)")
+
+                        async def _gated_click(item: tuple[bytes, str, str, str]):
+                            _mid, _to, _vurl, _vtext = item
+                            async with sem:
+                                ok, final_url, status = await click_verify_link_async(
+                                    http_client, _vurl, timeout_s
+                                )
+                            return (_mid, _to, _vurl, _vtext, ok, final_url, status)
+
+                        results = await asyncio.gather(
+                            *[_gated_click(it) for it in pending_clicks],
+                            return_exceptions=False,
+                        )
+                        elapsed = time.time() - t0
+                        print(f"[verify] batch done in {elapsed:.1f}s ({len(results)} click)")
+
+                        # ---- Phase 3: DB finalize + mark_seen (sync, sequential) ----
+                        for mid, to_addr, vurl, vtext, ok, final_url, status in results:
+                            if ok:
+                                print(f"[verify] OK {to_addr} status={status} {vtext!r}")
+                                mark_seen(mail, mid)
+                                if _DB_OK and to_addr:
+                                    try:
+                                        if get_account(to_addr) is not None:
+                                            update_status(
+                                                to_addr,
+                                                STATUS_VERIFIED,
+                                                verified_ts=int(time.time()),
+                                                error=None,
+                                            )
+                                            append_event(
+                                                to_addr, "verify", ok=True,
+                                                detail=f"status={status} final_url={final_url}",
+                                            )
+                                            print(f"[db] {to_addr} -> verified")
+                                    except Exception as e:
+                                        print(f"[db] update verified failed: {e}")
+                            else:
+                                print(f"[verify] FAILED {to_addr} status={status} url={final_url}")
+                                # Click fail → DB sẽ thành failed_verify (terminal), mark seen luôn
+                                # để session sau không re-fetch body của mail này nữa.
+                                try:
+                                    mark_seen(mail, mid)
+                                except Exception as e:
+                                    print(f"[mail] mark_seen (fail) failed mid={mid!r}: {e}")
+                                if _DB_OK and to_addr:
+                                    try:
+                                        if get_account(to_addr) is not None:
+                                            update_status(
+                                                to_addr,
+                                                STATUS_FAILED_VERIFY,
+                                                error=f"http {status}",
+                                                bump_attempts=True,
+                                            )
+                                            append_event(
+                                                to_addr, "verify", ok=False,
+                                                detail=f"status={status} url={final_url}",
+                                            )
+                                            print(f"[db] {to_addr} -> failed_verify")
+                                    except Exception as e:
+                                        print(f"[db] update failed_verify failed: {e}")
+
                 while True:
                     try:
-                        ids = fetch_messages(mail, folder, sender, only_unseen=not include_seen)
+                        ids = fetch_messages(
+                            mail, folder, sender,
+                            only_unseen=not include_seen,
+                            newest_first=include_seen,
+                        )
                     except Exception as e:
                         print(f"[poll] search failed: {e}")
                         ids = []
 
                     new_ids = [i for i in ids if i not in seen_ids]
-                    if new_ids:
-                        print(f"\n[poll] {len(new_ids)} mail mới (total match: {len(ids)})")
 
-                        # ---- Phase 1: render + DB flip awaiting_mail -> awaiting_verify (sync) ----
-                        pending_clicks: list[tuple[bytes, str, str, str]] = []
-                        for mid in new_ids:
-                            try:
-                                matched, links, to_addr = render_message(mail, mid, sender, quiet=quiet)
-                            except Exception as e:
-                                print(f"[mail] render failed id={mid!r}: {e}")
-                                continue
-                            if not matched:
-                                continue
-                            seen_ids.add(mid)
-
-                            should_skip_verify = False
-                            if _DB_OK and to_addr:
-                                try:
-                                    acc = get_account(to_addr)
-                                    if acc is None:
-                                        print(f"[db] WARN {to_addr} không có trong accounts.db (skip)")
-                                        should_skip_verify = True
-                                    else:
-                                        cur_status = acc["status"]
-                                        if cur_status == STATUS_AWAITING_MAIL:
-                                            update_status(
-                                                to_addr,
-                                                STATUS_AWAITING_VERIFY,
-                                                mail_received_ts=int(time.time()),
-                                            )
-                                            append_event(to_addr, "mail_received", ok=True)
-                                            print(f"[db] {to_addr} -> awaiting_verify")
-                                        elif cur_status == STATUS_AWAITING_VERIFY:
-                                            print(f"[db] {to_addr} status=awaiting_verify (re-verify)")
-                                        elif cur_status in (STATUS_VERIFIED, STATUS_EXPORTED_VERIFIED):
-                                            print(f"[db] {to_addr} status={cur_status} (skip, already verified)")
-                                            should_skip_verify = True
-                                        elif cur_status in (STATUS_FAILED_VERIFY, STATUS_EXPORTED_FAILED_VERIFY):
-                                            print(f"[db] {to_addr} status={cur_status} (skip, failed previously)")
-                                            should_skip_verify = True
-                                        else:
-                                            print(f"[db] {to_addr} status={cur_status} (skip)")
-                                            should_skip_verify = True
-                                except Exception as e:
-                                    print(f"[db] update mail_received failed: {e}")
-
-                            if should_skip_verify:
-                                continue
-                            if not verify:
-                                continue
-                            hit = find_verify_link(links, keywords)
-                            if hit is None:
-                                print(f"[verify] {to_addr or '?'} không tìm thấy link match keywords {keywords}")
-                                continue
-                            vurl, vtext = hit
-                            pending_clicks.append((mid, to_addr, vurl, vtext))
-
-                        # ---- Phase 2: parallel async click ----
-                        if pending_clicks:
-                            t0 = time.time()
-                            print(f"[verify] click {len(pending_clicks)} link song song (concurrency={concurrency}, timeout={timeout_s}s)")
-
-                            async def _gated_click(item: tuple[bytes, str, str, str]):
-                                _mid, _to, _vurl, _vtext = item
-                                async with sem:
-                                    ok, final_url, status = await click_verify_link_async(
-                                        http_client, _vurl, timeout_s
-                                    )
-                                return (_mid, _to, _vurl, _vtext, ok, final_url, status)
-
-                            results = await asyncio.gather(
-                                *[_gated_click(it) for it in pending_clicks],
-                                return_exceptions=False,
-                            )
-                            elapsed = time.time() - t0
-                            print(f"[verify] batch done in {elapsed:.1f}s ({len(results)} click)")
-
-                            # ---- Phase 3: DB finalize + mark_seen (sync, sequential) ----
-                            for mid, to_addr, vurl, vtext, ok, final_url, status in results:
-                                if ok:
-                                    print(f"[verify] OK {to_addr} status={status} {vtext!r}")
-                                    mark_seen(mail, mid)
-                                    if _DB_OK and to_addr:
-                                        try:
-                                            if get_account(to_addr) is not None:
-                                                update_status(
-                                                    to_addr,
-                                                    STATUS_VERIFIED,
-                                                    verified_ts=int(time.time()),
-                                                    error=None,
-                                                )
-                                                append_event(
-                                                    to_addr, "verify", ok=True,
-                                                    detail=f"status={status} final_url={final_url}",
-                                                )
-                                                print(f"[db] {to_addr} -> verified")
-                                        except Exception as e:
-                                            print(f"[db] update verified failed: {e}")
+                    if include_seen and new_ids:
+                        # ---- Backfill mode: newest-first chunked scan, stop khi awaiting_verify=0 ----
+                        remaining = count_awaiting_verify() if _DB_OK else -1
+                        total_chunks = (len(new_ids) + chunk_size - 1) // chunk_size
+                        print(
+                            f"\n[backfill] start: {len(new_ids)} mail (newest first), "
+                            f"awaiting_verify={remaining if _DB_OK else 'N/A'}, "
+                            f"chunk={chunk_size} max_scan={max_scan} no_progress_limit=3"
+                        )
+                        scanned = 0
+                        no_progress = 0
+                        chunk_n = 0
+                        for start_idx in range(0, len(new_ids), chunk_size):
+                            if scanned >= max_scan:
+                                print(f"[backfill] hit max_scan={max_scan}, dừng")
+                                break
+                            if _DB_OK and remaining == 0:
+                                print("[backfill] awaiting_verify=0, hết việc → dừng")
+                                break
+                            chunk_n += 1
+                            chunk = new_ids[start_idx:start_idx + chunk_size]
+                            print(f"\n[backfill] chunk {chunk_n}/{total_chunks}: {len(chunk)} mail (scanned={scanned})")
+                            await process_chunk(chunk)
+                            scanned += len(chunk)
+                            if _DB_OK:
+                                new_remaining = count_awaiting_verify()
+                                delta = remaining - new_remaining
+                                if delta <= 0:
+                                    no_progress += 1
                                 else:
-                                    print(f"[verify] FAILED {to_addr} status={status} url={final_url}")
-                                    if _DB_OK and to_addr:
-                                        try:
-                                            if get_account(to_addr) is not None:
-                                                update_status(
-                                                    to_addr,
-                                                    STATUS_FAILED_VERIFY,
-                                                    error=f"http {status}",
-                                                    bump_attempts=True,
-                                                )
-                                                append_event(
-                                                    to_addr, "verify", ok=False,
-                                                    detail=f"status={status} url={final_url}",
-                                                )
-                                                print(f"[db] {to_addr} -> failed_verify")
-                                        except Exception as e:
-                                            print(f"[db] update failed_verify failed: {e}")
+                                    no_progress = 0
+                                print(
+                                    f"[backfill] chunk {chunk_n} done: awaiting_verify={new_remaining} "
+                                    f"(was {remaining}, delta={-delta:+d}) no_progress={no_progress}/3"
+                                )
+                                remaining = new_remaining
+                                if no_progress >= 3:
+                                    print(
+                                        "[backfill] 3 chunks liên tiếp không giảm awaiting_verify → "
+                                        "dừng (các mail còn lại không khớp account nào)"
+                                    )
+                                    break
+                        print(
+                            f"\n[backfill] done: scanned={scanned}/{len(new_ids)} "
+                            f"awaiting_verify_remaining={remaining if _DB_OK else 'N/A'}"
+                        )
+                    elif new_ids:
+                        print(f"\n[poll] {len(new_ids)} mail mới (total match: {len(ids)})")
+                        await process_chunk(new_ids)
                     else:
                         print(f"[poll] no new mail (match: {len(ids)})", end="\r", flush=True)
 
@@ -561,6 +642,18 @@ def main() -> int:
         action="store_false",
         help="in đầy đủ TEXT/HTML body + links (debug)",
     )
+    p.add_argument(
+        "--max-scan",
+        type=int,
+        default=5000,
+        help="backfill: số mail tối đa quét trong 1 lần chạy (default 5000)",
+    )
+    p.add_argument(
+        "--chunk-size",
+        type=int,
+        default=200,
+        help="backfill: số mail mỗi chunk (default 200)",
+    )
     args = p.parse_args()
     include_seen = args.all or args.backfill_awaiting
     if args.backfill_awaiting and not args.all:
@@ -572,6 +665,8 @@ def main() -> int:
                 include_seen=include_seen,
                 verify=args.verify,
                 quiet=args.quiet,
+                max_scan=args.max_scan,
+                chunk_size=args.chunk_size,
             )
         )
     except KeyboardInterrupt:

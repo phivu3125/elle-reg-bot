@@ -157,12 +157,12 @@ def reset_stuck() -> None:
 
 
 def run_mail_backfill() -> None:
-    _print_header("Mail verifier — backfill awaiting (quét cả mail đã đọc)")
-    print("Dùng khi mail xác minh tới rất trễ (vài giờ sau register).")
-    print("Sẽ quét CẢ mail đã đọc và verify lại các account còn awaiting_mail/awaiting_verify.")
+    _print_header("Mail verifier — recovery một lần (quét cả mail đã đọc)")
+    print("Dùng KHI có nhiều account kẹt awaiting_verify từ phiên cũ.")
+    print("Quét CẢ mail đã đọc (SEEN) một lần duy nhất rồi tự thoát.")
     print("Account đã verified hoặc failed_verify sẽ được skip.")
-    print("Ctrl+C để dừng listener.")
-    _run_script("check_elle_mail.py", "--backfill-awaiting")
+    print("Cho ops thường ngày → dùng option 2 (UNSEEN daemon, chạy 24/7).")
+    _run_script("check_elle_mail.py", "--backfill-awaiting", "--once")
 
 
 def menu() -> int:
@@ -175,7 +175,7 @@ def menu() -> int:
         print("5) Generate aliases → DB")
         print("6) Show DB stats")
         print("7) Reset stuck registering")
-        print("8) Mail verifier — backfill awaiting (mail tới trễ)")
+        print("8) Mail verifier — recovery 1 lần (cứu awaiting_verify kẹt cũ)")
         print("0) Exit")
         try:
             choice = input("Chọn: ").strip()

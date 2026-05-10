@@ -398,6 +398,16 @@ def stats() -> dict:
     return out
 
 
+def count_awaiting_verify() -> int:
+    """Đếm số account đang ở trạng thái awaiting_verify (đã thấy mail, chưa verify OK)."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM accounts WHERE status = ?",
+            (STATUS_AWAITING_VERIFY,),
+        ).fetchone()
+    return int(row["c"]) if row else 0
+
+
 def export_by_status(statuses: Iterable[str], use_raw: bool = True) -> list[dict]:
     """Trả list rows (dict) có status thuộc `statuses`.
 
