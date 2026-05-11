@@ -89,183 +89,69 @@ def detect_turnstile(page: Page) -> bool:
         return False
 
 
-SITEKEY_RE = re.compile(r'(0x4[A-Za-z0-9_-]{20,})')
+def solve_on_real_page(page: Page, max_attempts: int = 30) -> Optional[str]:
+    """Solve Turnstile DIRECTLY on real page (no fake page).
 
+    Token sẽ gắn đúng action/cdata/origin context mà real page widget
+    đã khai báo → server elle.vn validate sẽ accept.
 
-def extract_sitekey(page: Page) -> Optional[str]:
-    # 1) data-sitekey attribute (fast path)
+    Cloudflare có thể nest iframe nhiều cấp → dùng `page.frames` (flat list
+    mọi depth) tìm frame có URL `challenges.cloudflare.com`, lấy
+    `frame_element()` ra ElementHandle ở parent frame rồi click lên đó.
+    Browser forward hit-test vào checkbox cross-origin. Cloudflare tự set
+    hidden input + gọi callback nội tại → KHÔNG cần inject token.
+    """
+    # Chờ cloudflare frame attach (poll page.frames thay vì page.locator)
+    deadline = time.time() + 10.0
+    cf_frame = None
+    while time.time() < deadline:
+        for f in page.frames:
+            if "challenges.cloudflare.com" in (f.url or ""):
+                cf_frame = f
+                break
+        if cf_frame:
+            break
+        page.wait_for_timeout(200)
+
+    if not cf_frame:
+        print("[solver-real] no cloudflare frame attached within 10s")
+        return None
+    print(f"[solver-real] cf frame found: {cf_frame.url[:80]}")
+
+    # Lấy ElementHandle của iframe trong parent frame
     try:
-        loc = page.locator('[data-sitekey]').first
-        if loc.count() > 0:
-            sk = loc.get_attribute('data-sitekey')
-            if sk and sk.startswith('0x'):
-                print(f"[sitekey] via data-sitekey attr: {sk}")
-                return sk
+        elem = cf_frame.frame_element()
     except Exception as e:
-        print(f"[sitekey] attr probe failed: {e}")
+        print(f"[solver-real] frame_element() failed: {e}")
+        return None
 
-    # 2) regex on main HTML
+    # Shrink để click landing trên checkbox (cùng trick fake-mode dùng)
     try:
-        html = page.content()
-        m = SITEKEY_RE.search(html)
-        if m:
-            print(f"[sitekey] via main HTML regex: {m.group(1)}")
-            return m.group(1)
-    except Exception as e:
-        print(f"[sitekey] HTML regex failed: {e}")
-
-    # 3) regex on every script src + inline script body via JS
-    try:
-        sk = page.evaluate(r"""
-            () => {
-                const re = /0x4[A-Za-z0-9_-]{20,}/;
-                const scripts = Array.from(document.querySelectorAll('script'));
-                for (const s of scripts) {
-                    const txt = s.textContent || '';
-                    const m = txt.match(re);
-                    if (m) return m[0];
-                }
-                const html = document.documentElement.outerHTML;
-                const m2 = html.match(re);
-                return m2 ? m2[0] : null;
+        elem.evaluate("""
+            el => {
+                el.style.width = '70px';
+                if (el.parentElement) el.parentElement.style.width = '70px';
             }
         """)
-        if sk:
-            print(f"[sitekey] via JS scan: {sk}")
-            return sk
     except Exception as e:
-        print(f"[sitekey] JS scan failed: {e}")
+        print(f"[solver-real] shrink failed: {e}")
 
-    # 4) iframe URL param (Cloudflare challenge frame embeds sitekey in URL)
-    try:
-        for f in page.frames:
-            url = f.url or ""
-            if "challenges.cloudflare.com" in url:
-                m = re.search(r'[?&/]sitekey[=/]([^&/?]+)', url)
-                if m:
-                    print(f"[sitekey] via iframe URL param: {m.group(1)}")
-                    return m.group(1)
-                m = SITEKEY_RE.search(url)
-                if m:
-                    print(f"[sitekey] via iframe URL regex: {m.group(1)}")
-                    return m.group(1)
-    except Exception as e:
-        print(f"[sitekey] iframe probe failed: {e}")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            val = page.input_value('input[name="cf-turnstile-response"]', timeout=2000)
+        except Exception:
+            val = ""
+        if val:
+            print(f"[solver-real] token len={len(val)} after {attempt} attempt(s)")
+            return val
+        try:
+            elem.click(force=True, timeout=1000)
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
 
+    print(f"[solver-real] timeout after {max_attempts} attempts")
     return None
-
-
-# In-context Turnstile solver. Runs inside the SAME browser context as the
-# register page so cookies / TLS / fingerprint match. Mirrors Theyka's
-# Turnstile-Solver approach (page.route + minimal HTML host + shrink widget +
-# click via locator) but reuses our context instead of spawning a separate browser.
-TURNSTILE_HOST_HTML = """<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ts</title>
-<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
-</head><body>
-<div class="cf-turnstile" style="background: white;" data-sitekey="__SITEKEY__"></div>
-</body></html>"""
-
-
-def solve_in_context(context, sitekey: str, origin: str = "https://events.elle.vn",
-                     max_attempts: int = 30) -> Optional[str]:
-    """Open a fake page in the same browser context, embed Turnstile widget,
-    shrink it, click the .cf-turnstile div until the hidden response input
-    has a value. Returns token or None.
-    """
-    fake_url = origin.rstrip("/") + "/"
-    html = TURNSTILE_HOST_HTML.replace("__SITEKEY__", sitekey)
-    page = context.new_page()
-    try:
-        page.route(fake_url, lambda route: route.fulfill(
-            status=200, content_type="text/html; charset=utf-8", body=html))
-        try:
-            page.goto(fake_url, timeout=30_000)
-        except Exception as e:
-            print(f"[solver-ctx] goto error: {e}")
-            return None
-
-        # Shrink widget so the click lands on the checkbox iframe area.
-        try:
-            page.eval_on_selector("//div[@class='cf-turnstile']",
-                                  "el => el.style.width = '70px'")
-        except Exception as e:
-            print(f"[solver-ctx] shrink failed: {e}")
-
-        for attempt in range(1, max_attempts + 1):
-            try:
-                val = page.input_value("[name=cf-turnstile-response]", timeout=2000)
-            except Exception:
-                val = ""
-            if val:
-                print(f"[solver-ctx] token len={len(val)} after {attempt} attempt(s)")
-                return val
-            try:
-                page.locator("//div[@class='cf-turnstile']").click(timeout=1000)
-            except Exception:
-                pass
-            page.wait_for_timeout(500)
-
-        print(f"[solver-ctx] timeout after {max_attempts} attempts")
-        return None
-    finally:
-        try: page.close()
-        except Exception: pass
-
-
-# JS injection: set hidden input value via React-aware native setter,
-# fire input/change events, and trigger common framework callbacks.
-INJECT_TOKEN_JS = r"""
-(token) => {
-  let touched = 0;
-  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-  const inputs = document.querySelectorAll('input[name="cf-turnstile-response"], input[name="g-recaptcha-response"], input[id^="cf-chl-widget-"][id$="_response"]');
-  inputs.forEach(inp => {
-    setter.call(inp, token);
-    inp.dispatchEvent(new Event('input', { bubbles: true }));
-    inp.dispatchEvent(new Event('change', { bubbles: true }));
-    touched++;
-  });
-  // If page hadn't rendered the hidden input yet, create one inside the .cf-turnstile div.
-  if (touched === 0) {
-    const host = document.querySelector('.cf-turnstile, [data-sitekey]');
-    if (host) {
-      const inp = document.createElement('input');
-      inp.type = 'hidden';
-      inp.name = 'cf-turnstile-response';
-      inp.value = token;
-      host.appendChild(inp);
-      touched++;
-    }
-  }
-  let called = 0;
-  // Fallback 1: article-style global window.tsCallback
-  if (typeof window.tsCallback === 'function') {
-    try { window.tsCallback(token); called++; } catch (e) { console.error('[tsCallback]', e); }
-  }
-  // Fallback 2: data-callback="funcName" attribute on .cf-turnstile host
-  document.querySelectorAll('.cf-turnstile[data-callback], [data-sitekey][data-callback]').forEach(el => {
-    const fnName = el.getAttribute('data-callback');
-    if (fnName && typeof window[fnName] === 'function') {
-      try { window[fnName](token); called++; } catch (e) { console.error('[data-callback ' + fnName + ']', e); }
-    }
-  });
-  // Fallback 3: dispatch a synthetic event some libs listen for
-  try {
-    document.dispatchEvent(new CustomEvent('turnstile-success', { detail: { token } }));
-  } catch (e) {}
-  return { touched, called };
-}
-"""
-
-
-def inject_turnstile_token(page: Page, token: str) -> dict:
-    result = page.evaluate(INJECT_TOKEN_JS, token)
-    print(f"[inject] inputs touched={result.get('touched')} callbacks invoked={result.get('called')}")
-    return result
 
 
 # RSC line: "1:{\"error\":\"...\",\"success\":\"...\"}"
@@ -402,46 +288,27 @@ def register_one(context, email: str) -> RegisterResult:
         fill_form(page, form_data)
         t_phase["fill"] = int((time.time() - t0) * 1000)
 
-        # ── Phase 3: Turnstile (nếu có) ──
+        # ── Phase 3: Turnstile (nếu có) — giải trực tiếp trên real page ──
         if detect_turnstile(page):
             t0 = time.time()
-
-            # 3a. Poll sitekey (thay wait_for_timeout(2500) cố định)
-            sitekey = os.environ.get("TURNSTILE_SITEKEY")
-            if not sitekey:
-                mount_deadline = time.time() + _env_int("REG_CAPTCHA_MOUNT_TIMEOUT_MS", 5_000) / 1000
-                while time.time() < mount_deadline:
-                    sitekey = extract_sitekey(page)
-                    if sitekey:
-                        break
-                    page.wait_for_timeout(150)
-            if not sitekey:
-                raise RuntimeError("Không tìm được sitekey Turnstile")
-            print(f"[captcha] sitekey={sitekey}")
-
-            # 3b. Solve token
-            token = os.environ.get("TURNSTILE_TOKEN")
-            if not token:
-                from urllib.parse import urlsplit
-                sp = urlsplit(TARGET_URL)
-                origin = f"{sp.scheme}://{sp.netloc}"
-                max_attempts = int(os.environ.get("TURNSTILE_MAX_ATTEMPTS", "30"))
-                token = solve_in_context(context, sitekey, origin=origin, max_attempts=max_attempts)
+            max_attempts = int(os.environ.get("TURNSTILE_MAX_ATTEMPTS", "30"))
+            token = solve_on_real_page(page, max_attempts=max_attempts)
             if not token:
                 raise RuntimeError("Không lấy được Turnstile token")
 
-            # 3c. Inject + poll input value (thay wait_for_timeout(500) cố định)
-            inject_turnstile_token(page, token)
-            inject_deadline = time.time() + _env_int("REG_TOKEN_INJECT_TIMEOUT_MS", 2_000) / 1000
-            while time.time() < inject_deadline:
-                try:
-                    val = page.input_value('input[name="cf-turnstile-response"]', timeout=300)
-                except Exception:
-                    val = ""
-                if val:
-                    break
-                page.wait_for_timeout(80)
+            # Debug pause: xem widget real page state khi đã có token
+            _dbg_after_captcha = _env_int("REG_DEBUG_PAUSE_AFTER_CAPTCHA_MS", 0)
+            if _dbg_after_captcha > 0:
+                print(f"[debug-pause] after-captcha {_dbg_after_captcha}ms — xem widget state")
+                page.wait_for_timeout(_dbg_after_captcha)
+
             t_phase["captcha"] = int((time.time() - t0) * 1000)
+
+        # Debug pause: xem widget có nhận token / React state đã update chưa
+        _dbg_after_inject = _env_int("REG_DEBUG_PAUSE_AFTER_INJECT_MS", 0)
+        if _dbg_after_inject > 0:
+            print(f"[debug-pause] after-inject {_dbg_after_inject}ms — xem widget checkmark / React state")
+            page.wait_for_timeout(_dbg_after_inject)
 
         # ── Phase 4: submit + chờ response /register ──
         # Thay vì wait_for_url + networkidle + sleep cố định 2.5s, poll
@@ -483,6 +350,12 @@ def register_one(context, email: str) -> RegisterResult:
         t_phase["submit"] = int((time.time() - t0) * 1000)
         print(f"[timing] goto={t_phase['goto']}ms fill={t_phase['fill']}ms "
               f"captcha={t_phase['captcha']}ms submit={t_phase['submit']}ms")
+
+        # Debug pause: xem response / error overlay trên real page trước khi browser close
+        _dbg_after_submit = _env_int("REG_DEBUG_PAUSE_AFTER_SUBMIT_MS", 0)
+        if _dbg_after_submit > 0:
+            print(f"[debug-pause] after-submit {_dbg_after_submit}ms — xem response/error trên page")
+            page.wait_for_timeout(_dbg_after_submit)
 
         # Parse RSC response
         register_result = None
